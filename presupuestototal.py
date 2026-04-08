@@ -253,11 +253,9 @@ def convertir_a_ars(valor, moneda, cotizacion_usuario):
     return valor  # ya está en ARS
 
 def calcular_precio_mp_ars(materia_prima_id, cotizacion_usuario):
-    """
-    Precio unitario real en ARS con flete prorrateado.
-    Usa la cotización del USUARIO (no la guardada en la BD).
-    Retorna: (precio_total_ars, precio_base_ars, flete_unit_ars, fecha, fuente)
-    """
+
+    flete_unit_ars = 0.0  # ✅ SOLUCIÓN CLAVE
+
     datos = get_compra_cruda_mp(materia_prima_id)
     if datos is None:
         return None, None, 0.0, None, "sin precio"
@@ -268,27 +266,24 @@ def calcular_precio_mp_ars(materia_prima_id, cotizacion_usuario):
     nro     = datos["nro_comprobante"]
     cantidad = datos.get("cantidad", 1.0)
 
-    # Precio base en ARS con cotización del usuario
+    # Precio base
     if datos["precio_usd"] is not None:
         precio_base_ars = datos["precio_usd"] * cotizacion_usuario
     else:
         precio_base_ars = datos["precio_ars_directo"] or 0.0
 
-    # Costo total de ESTA compra en ARS (para prorratear el flete)
     costo_total_esta_compra_ars = precio_base_ars * cantidad
 
     if nro:
-        # Prorrateo del flete del comprobante
         df_comp = get_comprobante_crudo(nro)
-        if not df_comp.empty:
-            # Flete total del comprobante: MAX para evitar duplicados
-            idx_max     = df_comp["costo_flete"].idxmax()
-            row_flete   = df_comp.loc[idx_max]
-            flete_raw   = float(row_flete["costo_flete"])
-            flete_mon   = str(row_flete["moneda"] or "ARS").strip().upper()
-            flete_total_ars = convertir_a_ars(flete_raw, flete_mon, cotizacion_usuario)
 
-            # Suma de costos del comprobante recalculada con cotización usuario
+        if not df_comp.empty:
+            idx_max   = df_comp["costo_flete"].idxmax()
+            row_flete = df_comp.loc[idx_max]
+
+            # ✅ flete SIEMPRE en ARS
+            flete_total_ars = float(row_flete["costo_flete"])
+
             suma_ars = 0.0
             for _, r in df_comp.iterrows():
                 mon_r = str(r["moneda"] or "ARS").strip().upper()
@@ -296,19 +291,18 @@ def calcular_precio_mp_ars(materia_prima_id, cotizacion_usuario):
                 qty_r = float(r["cantidad"])
                 suma_ars += convertir_a_ars(pu_r, mon_r, cotizacion_usuario) * qty_r
 
-            suma_ars    = suma_ars or 1.0
-            proporcion  = costo_total_esta_compra_ars / suma_ars
-            flete_unit_ars = (flete_total_ars * proporcion) / cantidad if cantidad > 0 else 0
-        else:
-            flete_unit_ars = 0.0
+            suma_ars   = suma_ars or 1.0
+            proporcion = costo_total_esta_compra_ars / suma_ars
+
+            if cantidad > 0:
+                flete_unit_ars = (flete_total_ars * proporcion) / cantidad
+
     else:
-        flete_raw   = datos.get("flete_raw", 0.0)
-        flete_mon   = datos.get("flete_moneda", "ARS")
-        flete_ars   = convertir_a_ars(flete_raw, flete_mon, cotizacion_usuario)
-        flete_unit_ars = flete_ars / cantidad if cantidad > 0 else 0
+        flete_raw = datos.get("flete_raw", 0.0)
+        if cantidad > 0:
+            flete_unit_ars = flete_raw / cantidad  # ✅ ARS directo
 
     return precio_base_ars + flete_unit_ars, precio_base_ars, flete_unit_ars, fecha, fuente
-
 
 def get_ingredientes_con_precio(receta_id, cotizacion_usuario):
     """Ingredientes con precio en ARS usando la cotización actual del usuario."""
