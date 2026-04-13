@@ -266,6 +266,19 @@ def convertir_a_ars(valor, moneda, cotizacion_usuario):
         return valor * cotizacion_usuario
     return valor  # ya está en ARS
 
+def receta_valida(receta_id):
+    """Verifica si un receta_id es un entero válido (no None, NaN, '', 'nan', 'None')."""
+    if receta_id is None:
+        return False
+    s = str(receta_id).strip().lower()
+    if s in ("", "none", "nan", "null"):
+        return False
+    try:
+        int(float(s))
+        return True
+    except (ValueError, TypeError):
+        return False
+
 def calcular_precio_mp_ars(materia_prima_id, cotizacion_usuario):
     """
     Precio unitario real en ARS con flete prorrateado.
@@ -428,13 +441,13 @@ envase_desc  = prod_row.get("envase_desc") or "—"
 costo_insumos     = 0.0
 ingred_df         = pd.DataFrame()
 avisos_sin_precio = []
-if receta_id and str(receta_id).strip() not in ("", "None"):
+if receta_valida(receta_id):
     ingred_df = get_ingredientes_con_precio(int(receta_id), cotizacion_dolar)
     sin_p_df  = ingred_df[ingred_df["precio_unitario"].isna() | (ingred_df["precio_unitario"] == 0)]
     avisos_sin_precio = sin_p_df["nombre"].tolist()
     costo_insumos = ingred_df["costo_total_por_litro"].sum() * cap_litros
 else:
-    avisos_sin_precio = ["Producto sin receta asignada"]
+    avisos_sin_precio = [f"Este producto no tiene receta asignada en la BD (id_receta={receta_id!r})"]
 
 # Envase (USD → ARS con cotización usuario)
 precio_envase_usd = 0.0
@@ -459,7 +472,7 @@ overhead_por_unidad = overhead_por_litro * 1.0
 
 # Flete de receta
 flete_receta_por_unidad = 0.0
-if receta_id and str(receta_id).strip() not in ("", "None"):
+if receta_valida(receta_id):
     flete_receta_por_unidad = get_flete_receta(int(receta_id)) * cap_litros / 200.0
 
 # Totales
@@ -474,7 +487,10 @@ markup_pct      = (ganancia_abs / costo_total * 100) if costo_total > 0 else 0
 
 # ── AVISOS ────────────────────────────────────────────────────────────────────
 for av in avisos_sin_precio[:3]:
-    st.markdown(f'<div class="aviso">⚠ Sin precio: <b>{av}</b></div>', unsafe_allow_html=True)
+    if "sin receta" in av.lower() or "receta asignada" in av.lower():
+        st.markdown(f'<div class="info-box">ℹ {av} · Los insumos aparecen en $0.00</div>', unsafe_allow_html=True)
+    else:
+        st.markdown(f'<div class="aviso">⚠ Sin precio: <b>{av}</b></div>', unsafe_allow_html=True)
 if precio_venta == 0:
     st.markdown('<div class="info-box">ℹ Sin precio de venta registrado. Ingresá uno en el panel lateral.</div>', unsafe_allow_html=True)
 
@@ -799,7 +815,7 @@ with tabs[3]:
         p_cap = float(prod.get("capacidad_litros") or 1.0)
 
         ci = 0.0
-        if p_rec and str(p_rec).strip() not in ("", "None"):
+        if receta_valida(p_rec):
             try:
                 idf = get_ingredientes_con_precio(int(p_rec), cotizacion_dolar)
                 ci  = idf["costo_total_por_litro"].sum() * p_cap
@@ -817,7 +833,7 @@ with tabs[3]:
         oh = overhead_por_litro * 1.0
 
         fl = 0.0
-        if p_rec and str(p_rec).strip() not in ("", "None"):
+        if receta_valida(p_rec):
             try:
                 fl = get_flete_receta(int(p_rec)) * p_cap / 200.0
             except Exception:
@@ -896,7 +912,7 @@ with tabs[4]:
             p_env_desc = row_s.get("envase_desc") or "—"
 
             ci_s = 0.0
-            if p_rec_s and str(p_rec_s).strip() not in ("", "None"):
+            if receta_valida(p_rec_s):
                 try:
                     idf_s = get_ingredientes_con_precio(int(p_rec_s), cotizacion_dolar)
                     ci_s  = idf_s["costo_total_por_litro"].sum() * p_cap_s
@@ -912,7 +928,7 @@ with tabs[4]:
                     ce_s = 0.0
 
             fl_s = 0.0
-            if p_rec_s and str(p_rec_s).strip() not in ("", "None"):
+            if receta_valida(p_rec_s):
                 try:
                     fl_s = get_flete_receta(int(p_rec_s)) * p_cap_s / 200.0
                 except Exception:
