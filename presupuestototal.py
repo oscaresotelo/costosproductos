@@ -204,6 +204,20 @@ def get_overhead():
     return tot_g, tot_s, tot_g + tot_s
 
 @st.cache_data(ttl=60)
+def get_overhead_detalle():
+    """Devuelve gastos y empleados con id para edición."""
+    df_g = query("""
+        SELECT g.id, g.beneficiario_nombre as nombre, ci.nombre as categoria,
+               g.importe_total, g.moneda
+        FROM gastos g
+        LEFT JOIN categorias_imputacion ci ON g.categoria_id = ci.id
+        ORDER BY g.importe_total DESC
+    """)
+    df_e = query("SELECT id, nombre, sueldo_base FROM empleados ORDER BY nombre")
+    return df_g, df_e
+
+
+@st.cache_data(ttl=60)
 def get_flete_receta(receta_id):
     df = query("""
         SELECT monto FROM costos_flete_recetas
@@ -253,37 +267,41 @@ def convertir_a_ars(valor, moneda, cotizacion_usuario):
     return valor  # ya está en ARS
 
 def calcular_precio_mp_ars(materia_prima_id, cotizacion_usuario):
+    """
+    Precio unitario real en ARS con flete prorrateado.
+    Usa la cotización del USUARIO para convertir precio_unitario USD→ARS.
 
-    flete_unit_ars = 0.0  # ✅ SOLUCIÓN CLAVE
+    REGLA CRÍTICA: costo_flete SIEMPRE está en ARS en la BD, sin importar
+    la moneda del comprobante. Nunca se multiplica por la cotización.
+    Esto se verifica con: costo_total = precio_usd * cotiz * cantidad + flete_ars
 
+    Retorna: (precio_total_ars, precio_base_ars, flete_unit_ars, fecha, fuente)
+    """
     datos = get_compra_cruda_mp(materia_prima_id)
     if datos is None:
         return None, None, 0.0, None, "sin precio"
 
-    moneda  = datos["moneda"]
-    fecha   = datos["fecha"]
-    fuente  = datos["fuente"]
-    nro     = datos["nro_comprobante"]
+    fecha    = datos["fecha"]
+    fuente   = datos["fuente"]
+    nro      = datos["nro_comprobante"]
     cantidad = datos.get("cantidad", 1.0)
 
-    # Precio base
+    # Precio base en ARS con cotización del USUARIO
     if datos["precio_usd"] is not None:
         precio_base_ars = datos["precio_usd"] * cotizacion_usuario
     else:
         precio_base_ars = datos["precio_ars_directo"] or 0.0
 
-    costo_total_esta_compra_ars = precio_base_ars * cantidad
+    # Costo total de esta compra en ARS (para calcular proporción del flete)
+    costo_esta_ars = precio_base_ars * cantidad
 
     if nro:
         df_comp = get_comprobante_crudo(nro)
-
         if not df_comp.empty:
-            idx_max   = df_comp["costo_flete"].idxmax()
-            row_flete = df_comp.loc[idx_max]
+            # Flete total = MAX(costo_flete) — ya está en ARS, NO convertir
+            flete_total_ars = float(df_comp["costo_flete"].max() or 0)
 
-            # ✅ flete SIEMPRE en ARS
-            flete_total_ars = float(row_flete["costo_flete"])
-
+            # Suma de costos del comprobante recalculada con cotización usuario
             suma_ars = 0.0
             for _, r in df_comp.iterrows():
                 mon_r = str(r["moneda"] or "ARS").strip().upper()
@@ -291,34 +309,55 @@ def calcular_precio_mp_ars(materia_prima_id, cotizacion_usuario):
                 qty_r = float(r["cantidad"])
                 suma_ars += convertir_a_ars(pu_r, mon_r, cotizacion_usuario) * qty_r
 
-            suma_ars   = suma_ars or 1.0
-            proporcion = costo_total_esta_compra_ars / suma_ars
-
-            if cantidad > 0:
-                flete_unit_ars = (flete_total_ars * proporcion) / cantidad
-
+            suma_ars       = suma_ars or 1.0
+            proporcion     = costo_esta_ars / suma_ars
+            flete_unit_ars = (flete_total_ars * proporcion) / cantidad if cantidad > 0 else 0
+        else:
+            flete_unit_ars = 0.0
     else:
-        flete_raw = datos.get("flete_raw", 0.0)
-        if cantidad > 0:
-            flete_unit_ars = flete_raw / cantidad  # ✅ ARS directo
+        # Sin comprobante: flete directo de la fila, ya en ARS
+        flete_unit_ars = float(datos.get("flete_raw", 0.0)) / cantidad if cantidad > 0 else 0
 
     return precio_base_ars + flete_unit_ars, precio_base_ars, flete_unit_ars, fecha, fuente
 
+
 def get_ingredientes_con_precio(receta_id, cotizacion_usuario):
-    """Ingredientes con precio en ARS usando la cotización actual del usuario."""
+    """
+    Ingredientes con precio en ARS usando la cotización actual del usuario.
+    Todas las columnas de costo están normalizadas a 1 litro de producto final,
+    para que el display sea coherente con la unidad de envase.
+    """
     df = get_ingredientes_raw(receta_id).copy()
     precios, bases, fechas, fletes, fuentes = [], [], [], [], []
     for mp_id in df["materia_prima_id"]:
         p, pb, fl, f, src = calcular_precio_mp_ars(int(mp_id), cotizacion_usuario)
         precios.append(p); bases.append(pb); fletes.append(fl)
         fechas.append(f); fuentes.append(src)
-    df["precio_unitario"] = precios
+    df["precio_unitario"] = precios   # ARS por kg/L de materia prima
     df["precio_base"]     = bases
     df["precio_fecha"]    = fechas
-    df["flete_unitario"]  = fletes
+    df["flete_unitario"]  = fletes    # ARS por kg/L de materia prima
     df["fuente_precio"]   = fuentes
-    df["costo_linea"]     = df["cantidad"] * df["precio_unitario"].fillna(0)
+
+    # Normalizar a 1 litro de producto (receta = 200L base)
+    df["cantidad_por_litro"]     = df["cantidad"] / 200.0
+    df["costo_mp_por_litro"]     = df["cantidad_por_litro"] * df["precio_base"].fillna(0)
+    df["flete_por_litro"]        = df["cantidad_por_litro"] * df["flete_unitario"].fillna(0)
+    df["costo_total_por_litro"]  = df["costo_mp_por_litro"] + df["flete_por_litro"]
+
+    # costo_linea en escala 200L (para compatibilidad con comparativa)
+    df["costo_linea"] = df["cantidad"] * df["precio_unitario"].fillna(0)
     return df
+
+
+# ── INICIALIZAR SESSION STATE DE OVERHEAD ──────────────────────────────────────
+if "oh_gastos" not in st.session_state or "oh_empleados" not in st.session_state:
+    _df_g, _df_e = get_overhead_detalle()
+    st.session_state.oh_gastos    = {int(r["id"]): float(r["importe_total"]) for _, r in _df_g.iterrows()}
+    st.session_state.oh_nombres_g = {int(r["id"]): str(r["nombre"])    for _, r in _df_g.iterrows()}
+    st.session_state.oh_categ_g   = {int(r["id"]): str(r["categoria"] or "") for _, r in _df_g.iterrows()}
+    st.session_state.oh_empleados = {int(r["id"]): float(r["sueldo_base"]) for _, r in _df_e.iterrows()}
+    st.session_state.oh_nombres_e = {int(r["id"]): str(r["nombre"])    for _, r in _df_e.iterrows()}
 
 
 # ── HEADER ─────────────────────────────────────────────────────────────────────
@@ -393,7 +432,7 @@ if receta_id and str(receta_id).strip() not in ("", "None"):
     ingred_df = get_ingredientes_con_precio(int(receta_id), cotizacion_dolar)
     sin_p_df  = ingred_df[ingred_df["precio_unitario"].isna() | (ingred_df["precio_unitario"] == 0)]
     avisos_sin_precio = sin_p_df["nombre"].tolist()
-    costo_insumos = ingred_df["costo_linea"].sum() * cap_litros / 200.0
+    costo_insumos = ingred_df["costo_total_por_litro"].sum() * cap_litros
 else:
     avisos_sin_precio = ["Producto sin receta asignada"]
 
@@ -411,8 +450,10 @@ caja_info = None
 if tipo_caja_id:
     caja_info = get_info_caja(int(tipo_caja_id))
 
-# Overhead (1 litro fijo)
-total_gastos, total_sueldos, total_overhead = get_overhead()
+# Overhead (1 litro fijo) — usa valores editados del session_state
+total_gastos  = sum(st.session_state.oh_gastos.values())
+total_sueldos = sum(st.session_state.oh_empleados.values())
+total_overhead = total_gastos + total_sueldos
 overhead_por_litro  = total_overhead / capacidad_planta if capacidad_planta > 0 else 0
 overhead_por_unidad = overhead_por_litro * 1.0
 
@@ -567,35 +608,62 @@ with tabs[1]:
         )
 
         c1, c2, c3, c4, c5, c6 = st.columns([2.5, 0.9, 1.1, 1, 1, 1.3])
-        for col, h in zip([c1,c2,c3,c4,c5,c6], ["Ingrediente","Cantidad","$ base/u","Flete/u","Costo línea","Fuente"]):
+        for col, h in zip([c1,c2,c3,c4,c5,c6], ["Ingrediente","Cant/L prod.","$ MP/unidad","Flete/unidad","Costo/unidad","Fuente"]):
             with col:
                 st.markdown(f'<div style="font-size:0.82rem;letter-spacing:2px;color:var(--muted);text-transform:uppercase;">{h}</div>', unsafe_allow_html=True)
 
         st.markdown('<hr style="border-color:var(--border);margin:0.4rem 0;">', unsafe_allow_html=True)
 
         for _, row in ingred_df.iterrows():
-            sin_p          = pd.isna(row["precio_unitario"]) or row["precio_unitario"] == 0
-            costo_escalado = row["costo_linea"] * cap_litros / 200.0
-            flete_u        = float(row.get("flete_unitario", 0) or 0)
-            fuente         = str(row.get("fuente_precio", "") or "")
-            p_base_solo    = float(row.get("precio_base") or 0) if not sin_p else 0
+            sin_p = pd.isna(row["precio_unitario"]) or row["precio_unitario"] == 0
+
+            # Todo en ARS por unidad final de producto (ej: botella de 5L)
+            costo_mp_u  = float(row.get("costo_mp_por_litro", 0) or 0) * cap_litros
+            flete_u     = float(row.get("flete_por_litro", 0) or 0) * cap_litros
+            costo_tot_u = float(row.get("costo_total_por_litro", 0) or 0) * cap_litros
+            cant_litro  = float(row.get("cantidad_por_litro", 0) or 0)
+            fuente      = str(row.get("fuente_precio", "") or "")
+            moneda_mp   = "ARS" if float(row.get("flete_unitario", 0) or 0) == 0 and float(row.get("precio_base", 0) or 0) < 100 else ""
 
             c1, c2, c3, c4, c5, c6 = st.columns([2.5, 0.9, 1.1, 1, 1, 1.3])
             with c1:
                 tag = '<span class="tag-sin-precio">sin precio</span>' if sin_p else ""
-                st.markdown(f'<div style="font-size:0.92rem;padding:0.3rem 0;">{row["nombre"]} {tag}</div>', unsafe_allow_html=True)
+                st.markdown(
+                    f'<div style="font-size:0.92rem;padding:0.3rem 0;">{row["nombre"]} {tag}</div>',
+                    unsafe_allow_html=True
+                )
             with c2:
-                st.markdown(f'<div style="font-size:0.92rem;padding:0.3rem 0;color:var(--muted);">{row["cantidad"]} {row["unidad"]}</div>', unsafe_allow_html=True)
+                # Mostrar cantidad normalizada por litro de producto
+                st.markdown(
+                    f'<div style="font-size:0.85rem;padding:0.3rem 0;color:var(--muted);">' +
+                    f'{cant_litro:.4f} {row["unidad"]}/L</div>',
+                    unsafe_allow_html=True
+                )
             with c3:
-                st.markdown(f'<div style="font-size:0.92rem;padding:0.3rem 0;color:var(--accent2);">$ {p_base_solo:,.2f}</div>', unsafe_allow_html=True)
+                # Costo del ingrediente por unidad (sin flete)
+                st.markdown(
+                    f'<div style="font-size:0.92rem;padding:0.3rem 0;color:var(--accent2);">$ {costo_mp_u:,.2f}</div>',
+                    unsafe_allow_html=True
+                )
             with c4:
+                # Flete por unidad de producto final
                 fc = "var(--yellow)" if flete_u > 0 else "var(--muted)"
-                st.markdown(f'<div style="font-size:0.92rem;padding:0.3rem 0;color:{fc};">$ {flete_u:,.2f}</div>', unsafe_allow_html=True)
+                st.markdown(
+                    f'<div style="font-size:0.92rem;padding:0.3rem 0;color:{fc};">$ {flete_u:,.2f}</div>',
+                    unsafe_allow_html=True
+                )
             with c5:
+                # Costo total (ingrediente + flete) por unidad
                 cc = "var(--muted)" if sin_p else "var(--accent)"
-                st.markdown(f'<div style="font-size:0.92rem;padding:0.3rem 0;color:{cc};">$ {costo_escalado:,.2f}</div>', unsafe_allow_html=True)
+                st.markdown(
+                    f'<div style="font-size:0.92rem;padding:0.3rem 0;color:{cc};">$ {costo_tot_u:,.2f}</div>',
+                    unsafe_allow_html=True
+                )
             with c6:
-                st.markdown(f'<div style="font-size:0.75rem;padding:0.3rem 0;color:var(--muted);">{fuente}</div>', unsafe_allow_html=True)
+                st.markdown(
+                    f'<div style="font-size:0.75rem;padding:0.3rem 0;color:var(--muted);">{fuente}</div>',
+                    unsafe_allow_html=True
+                )
 
         st.markdown('<hr style="border-color:var(--border);margin:0.6rem 0;">', unsafe_allow_html=True)
         ct1, _, _, _, ct5, _ = st.columns([2.5, 0.9, 1.1, 1, 1, 1.3])
@@ -607,7 +675,7 @@ with tabs[1]:
         if mostrar_grafico_ing:
             st.markdown('<div class="section-header" style="margin-top:1.5rem;">Participación por ingrediente</div>', unsafe_allow_html=True)
             df_chart = ingred_df.copy()
-            df_chart["costo_escalado"] = df_chart["costo_linea"] * cap_litros / 200.0
+            df_chart["costo_escalado"] = df_chart["costo_total_por_litro"] * cap_litros
             df_chart = df_chart[df_chart["costo_escalado"] > 0].sort_values("costo_escalado", ascending=False)
             if not df_chart.empty:
                 st.bar_chart(df_chart.set_index("nombre")["costo_escalado"], color="#c8ff4e")
@@ -615,55 +683,103 @@ with tabs[1]:
 
 # ══ TAB 3 — OVERHEAD ═════════════════════════════════════════════════════════
 with tabs[2]:
-    col_ov1, col_ov2 = st.columns(2, gap="medium")
+    st.markdown(
+        '<div class="info-box">✏️ Editá los valores directamente. Los cambios se reflejan '
+        'al instante en el Resumen, Comparativa y Simulador.</div>',
+        unsafe_allow_html=True
+    )
 
+    col_ov1, col_ov2 = st.columns(2, gap="large")
+
+    # ── Gastos operativos editables ──────────────────────────────────────────
     with col_ov1:
-        st.markdown('<div class="section-header">Estructura de overhead</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-header">Gastos operativos</div>', unsafe_allow_html=True)
 
-        def mini_card(label, valor, color="var(--text)"):
-            st.markdown(f"""
-            <div class="metric-card" style="padding:0.9rem 1.1rem;">
-                <div class="metric-label">{label}</div>
-                <div style="font-family:'Syne',sans-serif;font-weight:700;font-size:1.3rem;color:{color};">$ {valor:,.0f}</div>
-            </div>""", unsafe_allow_html=True)
+        cambio_g = False
+        for gid, importe in st.session_state.oh_gastos.items():
+            nombre  = st.session_state.oh_nombres_g.get(gid, f"Gasto {gid}")
+            categ   = st.session_state.oh_categ_g.get(gid, "")
+            label   = f"{nombre}" + (f" ({categ})" if categ and categ != nombre else "")
+            nuevo   = st.number_input(
+                label, min_value=0.0, value=importe, step=1000.0,
+                format="%.0f", key=f"g_{gid}"
+            )
+            if nuevo != importe:
+                st.session_state.oh_gastos[gid] = nuevo
+                cambio_g = True
 
-        mini_card("Total gastos operativos", total_gastos, "var(--accent2)")
-        mini_card("Total sueldos empleados", total_sueldos, "var(--yellow)")
-        mini_card("OVERHEAD TOTAL", total_overhead, "var(--accent)")
+        if cambio_g:
+            st.rerun()
 
+        total_g_edit = sum(st.session_state.oh_gastos.values())
         st.markdown(f"""
-        <div class="block-box" style="margin-top:1rem;">
-            <div class="metric-label">Capacidad de planta</div>
-            <div style="font-size:1.2rem;font-weight:700;">{capacidad_planta:,.0f} L / mes</div>
-            <div style="font-size:0.92rem;color:var(--muted);margin-top:0.5rem;">
-                Overhead por litro: <b style="color:var(--accent);">$ {overhead_por_litro:,.2f}</b>
-            </div>
-            <div style="font-size:0.92rem;color:var(--muted);">
-                Overhead por unidad (1L fijo): <b style="color:var(--accent);">$ {overhead_por_unidad:,.2f}</b>
+        <div style="margin-top:0.8rem;padding:0.8rem 0;border-top:2px solid var(--accent2);">
+            <div class="costo-row" style="border:none;padding:0;">
+                <span style="font-family:'Syne',sans-serif;font-weight:700;">TOTAL GASTOS</span>
+                <span style="font-family:'Syne',sans-serif;font-weight:800;font-size:1.1rem;color:var(--accent2);">$ {total_g_edit:,.0f}</span>
             </div>
         </div>""", unsafe_allow_html=True)
 
+    # ── Sueldos editables ────────────────────────────────────────────────────
     with col_ov2:
-        st.markdown('<div class="section-header">Empleados</div>', unsafe_allow_html=True)
-        for _, e in get_all_empleados().iterrows():
+        st.markdown('<div class="section-header">Sueldos empleados</div>', unsafe_allow_html=True)
+
+        cambio_e = False
+        for eid, sueldo in st.session_state.oh_empleados.items():
+            nombre = st.session_state.oh_nombres_e.get(eid, f"Empleado {eid}")
+            nuevo  = st.number_input(
+                nombre, min_value=0.0, value=sueldo, step=1000.0,
+                format="%.0f", key=f"e_{eid}"
+            )
+            if nuevo != sueldo:
+                st.session_state.oh_empleados[eid] = nuevo
+                cambio_e = True
+
+        if cambio_e:
+            st.rerun()
+
+        total_e_edit = sum(st.session_state.oh_empleados.values())
+        st.markdown(f"""
+        <div style="margin-top:0.8rem;padding:0.8rem 0;border-top:2px solid var(--yellow);">
+            <div class="costo-row" style="border:none;padding:0;">
+                <span style="font-family:'Syne',sans-serif;font-weight:700;">TOTAL SUELDOS</span>
+                <span style="font-family:'Syne',sans-serif;font-weight:800;font-size:1.1rem;color:var(--yellow);">$ {total_e_edit:,.0f}</span>
+            </div>
+        </div>""", unsafe_allow_html=True)
+
+    # ── Resumen del overhead ─────────────────────────────────────────────────
+    st.markdown('<div class="section-header" style="margin-top:1rem;">Resumen</div>', unsafe_allow_html=True)
+    rc1, rc2, rc3, rc4 = st.columns(4)
+
+    def oh_card(col, label, valor, color):
+        with col:
             st.markdown(f"""
-            <div class="costo-row">
-                <span class="costo-nombre">{e['nombre']}</span>
-                <span class="costo-monto">$ {e['sueldo_base']:,.0f}</span>
+            <div class="metric-card" style="padding:0.9rem 1rem;">
+                <div class="metric-label">{label}</div>
+                <div style="font-family:'Syne',sans-serif;font-weight:800;font-size:1.3rem;color:{color};">$ {valor:,.0f}</div>
             </div>""", unsafe_allow_html=True)
 
-    if mostrar_overhead_detalle:
-        st.markdown('<div class="section-header" style="margin-top:1.5rem;">Detalle de gastos</div>', unsafe_allow_html=True)
-        gastos_df = get_all_gastos()
-        if not gastos_df.empty:
-            st.dataframe(
-                gastos_df, use_container_width=True, hide_index=True,
-                column_config={
-                    "importe_total": st.column_config.NumberColumn("Importe", format="$ %.0f"),
-                    "fecha_factura": "Fecha", "beneficiario_nombre": "Beneficiario",
-                    "categoria": "Categoría", "moneda": "Moneda", "observaciones": "Obs.",
-                }
-            )
+    oh_card(rc1, "Gastos operativos", total_gastos, "var(--accent2)")
+    oh_card(rc2, "Sueldos", total_sueldos, "var(--yellow)")
+    oh_card(rc3, "OVERHEAD TOTAL", total_overhead, "var(--accent)")
+    with rc4:
+        st.markdown(f"""
+        <div class="metric-card" style="padding:0.9rem 1rem;">
+            <div class="metric-label">Por litro / por unidad</div>
+            <div style="font-family:'Syne',sans-serif;font-weight:800;font-size:1.1rem;color:var(--accent);">
+                $ {overhead_por_litro:,.2f} / L
+            </div>
+            <div style="font-size:0.88rem;color:var(--muted);margin-top:0.3rem;">
+                Capacidad: {capacidad_planta:,.0f} L/mes
+            </div>
+        </div>""", unsafe_allow_html=True)
+
+    # ── Botón restaurar valores BD ───────────────────────────────────────────
+    st.markdown("<div style='margin-top:0.5rem;'></div>", unsafe_allow_html=True)
+    if st.button("↩ Restaurar valores originales de la BD"):
+        del st.session_state["oh_gastos"]
+        del st.session_state["oh_empleados"]
+        st.rerun()
 
 
 # ══ TAB 4 — COMPARATIVA ══════════════════════════════════════════════════════
@@ -686,7 +802,7 @@ with tabs[3]:
         if p_rec and str(p_rec).strip() not in ("", "None"):
             try:
                 idf = get_ingredientes_con_precio(int(p_rec), cotizacion_dolar)
-                ci  = idf["costo_linea"].sum() * p_cap / 200.0
+                ci  = idf["costo_total_por_litro"].sum() * p_cap
             except Exception:
                 ci = 0.0
 
@@ -783,7 +899,7 @@ with tabs[4]:
             if p_rec_s and str(p_rec_s).strip() not in ("", "None"):
                 try:
                     idf_s = get_ingredientes_con_precio(int(p_rec_s), cotizacion_dolar)
-                    ci_s  = idf_s["costo_linea"].sum() * p_cap_s / 200.0
+                    ci_s  = idf_s["costo_total_por_litro"].sum() * p_cap_s
                 except Exception:
                     ci_s = 0.0
 
