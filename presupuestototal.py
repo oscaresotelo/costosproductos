@@ -2,6 +2,14 @@ import streamlit as st
 import sqlite3
 import pandas as pd
 from pathlib import Path
+import io
+from datetime import date
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
+from reportlab.lib.units import cm
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, HRFlowable
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.enums import TA_CENTER, TA_RIGHT, TA_LEFT
 
 st.set_page_config(
     page_title="Minerva · Costos",
@@ -373,6 +381,242 @@ if "oh_gastos" not in st.session_state or "oh_empleados" not in st.session_state
     st.session_state.oh_nombres_e = {int(r["id"]): str(r["nombre"])    for _, r in _df_e.iterrows()}
 
 
+# ── FUNCIONES: ACTUALIZAR PRECIOS EN BD ───────────────────────────────────────
+
+def actualizar_precio_envase_bd(envase_id, nuevo_precio_usd):
+    """Inserta una nueva entrada de precio de envase en entradas_envases."""
+    conn = get_conn()
+    hoy = date.today().isoformat()
+    # Detectar columnas reales para no asumir el esquema
+    cursor = conn.execute("PRAGMA table_info(entradas_envases)")
+    cols = {row[1] for row in cursor.fetchall()}
+    if "cantidad" in cols:
+        conn.execute(
+            "INSERT INTO entradas_envases (envase_id, precio_unitario, fecha_ingreso, cantidad) VALUES (?, ?, ?, 0)",
+            (envase_id, nuevo_precio_usd, hoy)
+        )
+    else:
+        conn.execute(
+            "INSERT INTO entradas_envases (envase_id, precio_unitario, fecha_ingreso) VALUES (?, ?, ?)",
+            (envase_id, nuevo_precio_usd, hoy)
+        )
+    conn.commit()
+    get_ultimo_precio_envase.clear()
+
+def actualizar_precio_caja_bd(tipo_caja_id, nuevo_precio_ars):
+    """Guarda el nuevo precio de caja en tipo_cajas (columna costo_unitario)."""
+    conn = get_conn()
+    # Asegurar que la columna existe
+    try:
+        conn.execute("ALTER TABLE tipo_cajas ADD COLUMN costo_unitario REAL DEFAULT 0")
+        conn.commit()
+    except Exception:
+        pass
+    conn.execute("UPDATE tipo_cajas SET costo_unitario=? WHERE id=?", (nuevo_precio_ars, tipo_caja_id))
+    conn.commit()
+    get_info_caja.clear()
+
+def get_precio_caja(tipo_caja_id):
+    """Obtiene el precio unitario de la caja desde tipo_cajas."""
+    try:
+        df = query("SELECT costo_unitario FROM tipo_cajas WHERE id=?", (tipo_caja_id,))
+        if not df.empty and df.iloc[0]["costo_unitario"]:
+            return float(df.iloc[0]["costo_unitario"])
+    except Exception:
+        pass
+    return 0.0
+
+
+# ── FUNCIÓN: GENERAR PDF DE PRESUPUESTO ───────────────────────────────────────
+
+def generar_pdf_presupuesto(items, cliente_nombre, cotizacion, total_costo, total_venta, total_gan, margen):
+    """Genera un PDF profesional del presupuesto y devuelve bytes."""
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buffer, pagesize=A4,
+        rightMargin=1.8*cm, leftMargin=1.8*cm,
+        topMargin=2*cm, bottomMargin=2*cm
+    )
+
+    # Colores Minerva
+    VERDE_MINERVA = colors.HexColor("#4ade80")
+    ACCENT        = colors.HexColor("#c8ff4e")
+    DARK          = colors.HexColor("#0d0f14")
+    SURFACE       = colors.HexColor("#1c2030")
+    MUTED         = colors.HexColor("#a0a8bc")
+    AZUL          = colors.HexColor("#4ef0ff")
+    AMARILLO      = colors.HexColor("#fbbf24")
+    ROJO          = colors.HexColor("#ff5a5a")
+    BLANCO        = colors.white
+
+    styles = getSampleStyleSheet()
+
+    estilo_titulo = ParagraphStyle("titulo", parent=styles["Normal"],
+        fontSize=22, fontName="Helvetica-Bold", textColor=BLANCO,
+        spaceAfter=2, leading=26)
+    estilo_sub = ParagraphStyle("sub", parent=styles["Normal"],
+        fontSize=9, fontName="Helvetica", textColor=MUTED,
+        spaceAfter=4, leading=12)
+    estilo_seccion = ParagraphStyle("seccion", parent=styles["Normal"],
+        fontSize=9, fontName="Helvetica-Bold", textColor=MUTED,
+        spaceBefore=10, spaceAfter=4, leading=12)
+    estilo_normal = ParagraphStyle("normal", parent=styles["Normal"],
+        fontSize=9, fontName="Helvetica", textColor=BLANCO, leading=12)
+    estilo_pie = ParagraphStyle("pie", parent=styles["Normal"],
+        fontSize=8, fontName="Helvetica", textColor=MUTED,
+        alignment=TA_CENTER, leading=11)
+    estilo_nota = ParagraphStyle("nota", parent=styles["Normal"],
+        fontSize=8, fontName="Helvetica", textColor=MUTED, leading=11)
+
+    story = []
+
+    # ── Header ──
+    hoy_str = date.today().strftime("%d/%m/%Y")
+    nro_pres = f"PRES-{date.today().strftime('%Y%m%d')}"
+
+    header_data = [[
+        Paragraph(f"⚗ MINERVA", estilo_titulo),
+        Paragraph(f"<b>PRESUPUESTO</b><br/>{nro_pres}", ParagraphStyle("nro",
+            parent=styles["Normal"], fontSize=13, fontName="Helvetica-Bold",
+            textColor=ACCENT, alignment=TA_RIGHT, leading=18))
+    ]]
+    header_table = Table(header_data, colWidths=[10*cm, 7.5*cm])
+    header_table.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,-1), DARK),
+        ("TOPPADDING", (0,0), (-1,-1), 14),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 14),
+        ("LEFTPADDING", (0,0), (0,-1), 16),
+        ("RIGHTPADDING", (-1,0), (-1,-1), 16),
+        ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+        ("ROUNDEDCORNERS", [8, 8, 8, 8]),
+    ]))
+    story.append(header_table)
+    story.append(Spacer(1, 0.4*cm))
+
+    # ── Datos del presupuesto ──
+    meta_data = [
+        [
+            Paragraph(f"<b>Cliente:</b> {cliente_nombre}", estilo_normal),
+            Paragraph(f"<b>Fecha:</b> {hoy_str}", estilo_normal),
+            Paragraph(f"<b>Dólar:</b> $ {cotizacion:,.0f}", estilo_normal),
+        ]
+    ]
+    meta_table = Table(meta_data, colWidths=[6*cm, 5*cm, 6.5*cm])
+    meta_table.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,-1), SURFACE),
+        ("TOPPADDING", (0,0), (-1,-1), 8),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 8),
+        ("LEFTPADDING", (0,0), (-1,-1), 12),
+        ("TEXTCOLOR", (0,0), (-1,-1), BLANCO),
+        ("FONTNAME", (0,0), (-1,-1), "Helvetica"),
+        ("FONTSIZE", (0,0), (-1,-1), 9),
+    ]))
+    story.append(meta_table)
+    story.append(Spacer(1, 0.5*cm))
+
+    # ── Tabla de items ──
+    story.append(Paragraph("DETALLE DE PRODUCTOS", estilo_seccion))
+
+    col_widths = [5.5*cm, 3*cm, 2*cm, 2.5*cm, 2.5*cm, 2*cm]
+    headers = ["PRODUCTO / ENVASE", "COSTO UNIT.", "UNID.", "COSTO TOTAL", "VENTA TOTAL", "GANANCIA"]
+
+    tabla_data = [[Paragraph(f"<b>{h}</b>", ParagraphStyle("th",
+        parent=styles["Normal"], fontSize=8, fontName="Helvetica-Bold",
+        textColor=MUTED, alignment=TA_CENTER)) for h in headers]]
+
+    for item in items:
+        gan_item = item["precio_venta"] - item["costo_unit"]
+        gan_color = VERDE_MINERVA if gan_item >= 0 else ROJO
+        gan_str = f"$ {gan_item:,.0f}"
+
+        prod_cell = Paragraph(
+            f"<b>{item['producto']}</b><br/><font color='#{MUTED.hexval()[2:]}' size='7'>{item['envase']}</font>",
+            ParagraphStyle("prod", parent=styles["Normal"], fontSize=8.5,
+                fontName="Helvetica-Bold", textColor=BLANCO, leading=13)
+        )
+        tabla_data.append([
+            prod_cell,
+            Paragraph(f"$ {item['costo_unit']:,.2f}",  ParagraphStyle("td", parent=styles["Normal"], fontSize=8.5, textColor=AZUL, alignment=TA_RIGHT, leading=12)),
+            Paragraph(f"{item['unidades']:,}",          ParagraphStyle("td", parent=styles["Normal"], fontSize=8.5, textColor=BLANCO, alignment=TA_CENTER, leading=12)),
+            Paragraph(f"$ {item['costo_total']:,.0f}",  ParagraphStyle("td", parent=styles["Normal"], fontSize=8.5, textColor=ACCENT, alignment=TA_RIGHT, leading=12)),
+            Paragraph(f"$ {item['venta_total']:,.0f}",  ParagraphStyle("td", parent=styles["Normal"], fontSize=8.5, textColor=BLANCO, alignment=TA_RIGHT, leading=12)),
+            Paragraph(gan_str, ParagraphStyle("td", parent=styles["Normal"], fontSize=8.5, textColor=gan_color, alignment=TA_RIGHT, leading=12)),
+        ])
+
+    items_table = Table(tabla_data, colWidths=col_widths, repeatRows=1)
+    items_table.setStyle(TableStyle([
+        # Header
+        ("BACKGROUND", (0,0), (-1,0), DARK),
+        ("TOPPADDING", (0,0), (-1,0), 8),
+        ("BOTTOMPADDING", (0,0), (-1,0), 8),
+        ("LINEBELOW", (0,0), (-1,0), 1, ACCENT),
+        # Filas alternadas
+        *[("BACKGROUND", (0,i), (-1,i), SURFACE if i%2==0 else colors.HexColor("#151820"))
+          for i in range(1, len(tabla_data))],
+        ("TOPPADDING", (0,1), (-1,-1), 7),
+        ("BOTTOMPADDING", (0,1), (-1,-1), 7),
+        ("LEFTPADDING", (0,0), (0,-1), 10),
+        ("RIGHTPADDING", (-1,0), (-1,-1), 10),
+        ("LEFTPADDING", (1,0), (-1,-1), 6),
+        ("LINEBELOW", (0,1), (-1,-2), 0.3, colors.HexColor("#252a3a")),
+        ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+    ]))
+    story.append(items_table)
+    story.append(Spacer(1, 0.4*cm))
+
+    # ── Totales ──
+    total_unidades = sum(i["unidades"] for i in items)
+    margen_color = VERDE_MINERVA if margen >= 20 else (AMARILLO if margen >= 10 else ROJO)
+
+    totales_data = [
+        [
+            Paragraph(f"TOTAL UNIDADES: <b>{total_unidades:,}</b>", estilo_normal),
+            Paragraph(f"COSTO TOTAL: <b>$ {total_costo:,.0f}</b>", ParagraphStyle("tot",
+                parent=styles["Normal"], fontSize=10, fontName="Helvetica-Bold",
+                textColor=AZUL, alignment=TA_RIGHT, leading=14)),
+            Paragraph(f"VENTA TOTAL: <b>$ {total_venta:,.0f}</b>", ParagraphStyle("tot",
+                parent=styles["Normal"], fontSize=10, fontName="Helvetica-Bold",
+                textColor=BLANCO, alignment=TA_RIGHT, leading=14)),
+        ],
+        [
+            Paragraph(f"GANANCIA ESTIMADA: <b>$ {total_gan:,.0f}</b>",
+                ParagraphStyle("gan", parent=styles["Normal"], fontSize=9,
+                    fontName="Helvetica-Bold",
+                    textColor=VERDE_MINERVA if total_gan >= 0 else ROJO, leading=12)),
+            Paragraph("", estilo_normal),
+            Paragraph(f"MARGEN PROMEDIO: <b>{margen:.1f}%</b>",
+                ParagraphStyle("mg", parent=styles["Normal"], fontSize=10,
+                    fontName="Helvetica-Bold", textColor=margen_color,
+                    alignment=TA_RIGHT, leading=14)),
+        ]
+    ]
+    totales_table = Table(totales_data, colWidths=[5.5*cm, 5*cm, 7*cm])
+    totales_table.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,-1), DARK),
+        ("TOPPADDING", (0,0), (-1,-1), 10),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 10),
+        ("LEFTPADDING", (0,0), (-1,-1), 12),
+        ("RIGHTPADDING", (-1,0), (-1,-1), 12),
+        ("LINEABOVE", (0,0), (-1,0), 2, ACCENT),
+        ("LINEBELOW", (0,-1), (-1,-1), 1, colors.HexColor("#252a3a")),
+        ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+    ]))
+    story.append(totales_table)
+    story.append(Spacer(1, 1*cm))
+
+    # ── Pie de página ──
+    story.append(HRFlowable(width="100%", thickness=0.5, color=MUTED))
+    story.append(Spacer(1, 0.2*cm))
+    story.append(Paragraph(
+        f"Minerva · Costos  |  Documento generado el {hoy_str}  |  Precios en ARS — cotización USD $ {cotizacion:,.0f}  |  Documento confidencial",
+        estilo_pie
+    ))
+
+    doc.build(story)
+    buffer.seek(0)
+    return buffer.read()
+
+
 # ── HEADER ─────────────────────────────────────────────────────────────────────
 st.markdown("""
 <div class="titulo-principal">⚗️ Minerva · <span>Costos</span></div>
@@ -454,14 +698,30 @@ precio_envase_usd = 0.0
 fecha_envase      = None
 if envase_id:
     _pe, fecha_envase = get_ultimo_precio_envase(int(envase_id))
-    precio_envase_usd = float(_pe or 0)
+    precio_envase_usd = st.session_state.get(
+        "precio_envase_override",
+        float(_pe or 0)
+    )
 costo_envase = precio_envase_usd * cotizacion_dolar
 
 # Caja
-costo_caja_por_unidad = 0.0
+# Caja
+costo_caja_base = 0
 caja_info = None
+
 if tipo_caja_id:
     caja_info = get_info_caja(int(tipo_caja_id))
+    _precio_caja = get_precio_caja(int(tipo_caja_id))
+
+    if caja_info is not None and _precio_caja > 0:
+        upc = int(caja_info["unidades_por_caja"]) if int(caja_info["unidades_por_caja"]) > 0 else 1
+        costo_caja_base = _precio_caja / upc
+
+# Aplicar override SOLO para UI (no BD)
+costo_caja_por_unidad = st.session_state.get(
+    "precio_caja_override",
+    costo_caja_base
+)
 
 # Overhead (1 litro fijo) — usa valores editados del session_state
 total_gastos  = sum(st.session_state.oh_gastos.values())
@@ -548,8 +808,67 @@ with tabs[0]:
             <div class="block-box">
                 <div style="font-size:0.85rem;letter-spacing:2px;color:var(--muted);text-transform:uppercase;margin-bottom:0.5rem;">Caja</div>
                 <div style="font-size:1.05rem;">{caja_info['descripcion']}</div>
-                <div style="font-size:0.88rem;color:var(--muted);margin-top:0.3rem;">{caja_info['unidades_por_caja']} unidades por caja</div>
+                <div style="font-size:0.88rem;color:var(--muted);margin-top:0.3rem;">{caja_info['unidades_por_caja']} unidades por caja · Costo/u: <b style="color:var(--accent);">$ {costo_caja_por_unidad:,.2f}</b></div>
             </div>""", unsafe_allow_html=True)
+
+        # ── Edición precios envase y embalaje ──────────────────────────────────
+        st.markdown('<div class="section-header" style="margin-top:1.2rem;">✏️ Actualizar precios de envase / embalaje</div>', unsafe_allow_html=True)
+        st.markdown('<div class="info-box" style="font-size:0.88rem;">Ingresá los nuevos precios y presioná el botón para guardar en la base de datos.</div>', unsafe_allow_html=True)
+
+        edit_c1, edit_c2 = st.columns(2)
+
+        with edit_c1:
+            st.markdown('<div style="font-size:0.9rem;color:var(--muted);margin-bottom:0.3rem;">🫙 Precio envase (USD)</div>', unsafe_allow_html=True)
+            nuevo_precio_envase_usd = st.number_input(
+                "Nuevo precio envase (USD)",
+                min_value=0.0,
+                value=float(precio_envase_usd or 0.0),
+                step=0.01, format="%.4f",
+                key="edit_envase_usd",
+                label_visibility="collapsed",
+                help="Se guarda como nuevo registro en entradas_envases"
+            )
+            nuevo_precio_envase_ars = nuevo_precio_envase_usd * cotizacion_dolar
+            st.markdown(
+                f'<div style="font-size:0.82rem;color:var(--muted);margin-bottom:0.4rem;">'
+                f'= ARS <b style="color:var(--accent);">$ {nuevo_precio_envase_ars:,.2f}</b>'
+                f' al dólar $ {cotizacion_dolar:,.0f}</div>',
+                unsafe_allow_html=True
+            )
+            if envase_id and st.button("Aplicar precio envase", key="btn_apply_envase"):
+                st.session_state["precio_envase_override"] = nuevo_precio_envase_usd
+                st.success(f"✓ Precio envase actualizado: USD {nuevo_precio_envase_usd:.4f}")
+                st.cache_data.clear()
+                st.rerun()
+
+        with edit_c2:
+            if caja_info is not None and tipo_caja_id:
+                st.markdown('<div style="font-size:0.9rem;color:var(--muted);margin-bottom:0.3rem;">📦 Precio caja / embalaje (ARS)</div>', unsafe_allow_html=True)
+                _precio_caja_actual = get_precio_caja(int(tipo_caja_id))
+                nuevo_precio_caja = st.number_input(
+                    "Nuevo precio caja (ARS)",
+                    min_value=0.0,
+                    value=float(_precio_caja_actual or 0.0),
+                    step=100.0, format="%.2f",
+                    key="edit_caja_ars",
+                    label_visibility="collapsed",
+                    help="Precio total de la caja. Se divide entre unidades_por_caja para obtener costo unitario."
+                )
+                upc_edit = int(caja_info["unidades_por_caja"]) if int(caja_info["unidades_por_caja"]) > 0 else 1
+                costo_u_caja_edit = nuevo_precio_caja / upc_edit
+                st.markdown(
+                    f'<div style="font-size:0.82rem;color:var(--muted);margin-bottom:0.4rem;">'
+                    f'Costo/u: <b style="color:var(--accent);">$ {costo_u_caja_edit:,.2f}</b>'
+                    f' ({upc_edit} u/caja)</div>',
+                    unsafe_allow_html=True
+                )
+                if st.button("Aplicar precio embalaje", key="btn_apply_caja"):
+                    st.session_state["precio_caja_override"] = nuevo_precio_caja
+                    st.success(f"✓ Precio embalaje actualizado: $ {nuevo_precio_caja:,.2f}")
+                    st.cache_data.clear()
+                    st.rerun()
+            else:
+                st.markdown('<div class="block-box" style="padding:1rem;"><div style="color:var(--muted);font-size:0.9rem;">Sin embalaje asignado a este producto.</div></div>', unsafe_allow_html=True)
 
     with col2:
         st.markdown('<div class="section-header">Precio de venta y ganancia</div>', unsafe_allow_html=True)
@@ -1048,11 +1367,32 @@ with tabs[4]:
                     <span style="color:var(--muted);margin-left:0.4rem;">{pct_item:.0f}%</span></span>
                 </div>""", unsafe_allow_html=True)
 
-        # ── Botón limpiar ──
+        # ── Botones limpiar y PDF ──
         st.markdown("<div style='margin-top:1rem;'></div>", unsafe_allow_html=True)
-        if st.button("🗑 Limpiar presupuesto"):
-            st.session_state.presupuesto_items = []
-            st.rerun()
+        btn_col1, btn_col2 = st.columns([1, 1])
+        with btn_col1:
+            if st.button("🗑 Limpiar presupuesto"):
+                st.session_state.presupuesto_items = []
+                st.rerun()
+        with btn_col2:
+            if st.button("📄 Generar PDF del presupuesto"):
+                pdf_bytes = generar_pdf_presupuesto(
+                    items=items,
+                    cliente_nombre=cliente_sel,
+                    cotizacion=cotizacion_dolar,
+                    total_costo=total_costo_pres,
+                    total_venta=total_venta_pres,
+                    total_gan=total_gan_pres,
+                    margen=margen_pres,
+                )
+                nombre_archivo = f"presupuesto_{cliente_sel.replace(' ','_')}_{date.today().strftime('%Y%m%d')}.pdf"
+                st.download_button(
+                    label="⬇️ Descargar PDF",
+                    data=pdf_bytes,
+                    file_name=nombre_archivo,
+                    mime="application/pdf",
+                    key="dl_pdf"
+                )
 
     else:
         st.markdown("""
